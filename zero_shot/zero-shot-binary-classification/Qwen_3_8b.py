@@ -16,7 +16,7 @@ INPUT_CSV_PATH = "" # Dataset file path
 OUTPUT_DIR = "" # Output Directory
 COMMENT_COLUMN_NAME = "comment"
 GROUND_TRUTH_COLUMN_NAME = "is RB?"
-BATCH_SIZE = 16
+BATCH_SIZE = 16 
 
 MODEL_ID = "Qwen/Qwen3-8B" # Model ID
 
@@ -71,10 +71,10 @@ def setup_environment():
 def load_model_and_tokenizer():
     # Handles authentication and loads the full model.
 
-    print("Logging into Hugging Face Hub...")
+    print("Logging into Hugging Face Hub.")
     login(token=HF_API_KEY)
 
-    print(f"Loading model: {MODEL_ID} in full precision (bfloat16)...")
+    print(f"Loading model: {MODEL_ID} in full precision.")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         device_map="auto",
@@ -110,8 +110,7 @@ def parse_single_response(response_text):
     return prediction, reasoning
 
 def classify_batch(comments, model, tokenizer):
-    # Generates classifications for a batch of comments for high throughput.
-    
+    # Generates classifications for a batch of comments.
     messages = [
         [
             {"role": "system", "content": MODEL_PROMPT},
