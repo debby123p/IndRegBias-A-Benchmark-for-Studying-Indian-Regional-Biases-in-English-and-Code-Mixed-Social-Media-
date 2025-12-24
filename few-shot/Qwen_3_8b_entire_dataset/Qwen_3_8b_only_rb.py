@@ -1,36 +1,32 @@
 import os
+import pandas as pd
 import re
+import torch
 import gc
 import random
-import torch
-import pandas as pd
+import sys
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
-from sklearn.metrics import classification_report, confusion_matrix
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-CONFIG = {
-    "model_id": "Qwen/Qwen3-8B", # Model ID
-    "target_device": "cuda:1", # GPU ID
-    "batch_size": 16, # Batch size
-    "max_new_tokens": 256,
-    "hf_token": "", # Hugging_face Token 
-    "seed": 42
-}
-BASE_DIR = "" # Base directory to the data
-OUTPUT_DIR = "" # Output directory
-INPUT_DATA = os.path.join(BASE_DIR, "path_to_the_dataset") # Dataset file path
-FEW_SHOT_SOURCE = [os.path.join(BASE_DIR, "path_to_the_support_examples")] # Support file path
-
-# Saving the results
-PARTIAL_OUTPUT = os.path.join(OUTPUT_DIR, "classification_results_in_progress.csv")
-FINAL_OUTPUT = os.path.join(OUTPUT_DIR, "classification_results.csv")
-REPORT_FILE = os.path.join(OUTPUT_DIR, "classification_report.txt")
-MATRIX_IMG = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
 
 
-SYSTEM_PROMPT = """
+TARGET_GPU = "" # Target GPU node
+BASE_DATA_PATH = "" # Dataset file path
+OUTPUT_DIR = "" # Output Directory
+COMMENT_COLUMN_NAME = "comment"
+GROUND_TRUTH_COLUMN_NAME = "is RB?"
+BATCH_SIZE = 16
+
+INFERENCE_FILENAME = "" # Path to Inferencing data
+INFERENCE_FILE_PATH = os.path.join(BASE_DATA_PATH, INFERENCE_FILENAME)
+
+# Input/Output files
+RESULTS_CSV_PATH = os.path.join(OUTPUT_DIR, "classification_results_final.csv")
+REGIONAL_BIAS_EXAMPLES_PATH = os.path.join(BASE_DATA_PATH, "few_shot_data/selected_50_rb.csv")
+
+MODEL_PROMPT = """
 You are an expert in identifying regional biases in social media comments about Indian states and regions. Your task is to classify whether a comment contains regional biases or not.
 
 Task: Classify the given comment as either "REGIONAL BIAS" (1) or "NON-REGIONAL BIAS" (0).
@@ -43,201 +39,238 @@ Step-by-Step Analysis Process:
 Step 1: Identify Regional References
 Think: Does this comment mention or refer to:
 - Specific Indian states (e.g., Bihar, Kerala, Punjab, etc.)
-- Regional groups (e.g., South Indians, North Indians, Biharis, etc.)
+- Regional groups (e.g., South Indians, North Indians, etc.)
 - Cities or regions within India
 - Language communities within India
 
 Step 2: Check for Elements reinforcing biases
 Look for these patterns:
-- Generalisations about people from a region ("All X are Y")
-- Assumptions about regional characteristics
+- Generalisations about people from a state or a regional group ("All X are Y")
+- Assumptions about state/regional characteristics
 - Comparative statements that imply superiority/inferiority
 - Overgeneralized cultural, linguistic, economic, political, or infrastructural claims
-- Reinforcement of common regional stereotypes
 
 Step 3: Assess the Nature of the Statement
 Consider:
 - Is this a factual observation or a generalised assumption?
-- Does it reinforce existing biases or challenge them?
-- Is it based on personal experience or broad generalisation?
-- Does it promote understanding or perpetuate divisions?
+- Does it reinforce existing biases?
+- Is it based on a broad generalisation?
+- Does it perpetuate divisions?
 
 Step 4: Final Classification
 Based on the analysis above, classify as:
 - REGIONAL BIAS (1) if the comment reinforces regional biases or stereotypes
 - NON-REGIONAL BIAS (0) if the comment is neutral, factual, or doesn't contain regional bias.
 
-Output Format:
-Provide a brief reasoning followed by the classification.
-Format: "Reasoning: [text] ... Classification: [0 or 1]"
+Your response must include a brief line of reasoning followed by the final classification in the format "Classification: [0 or 1]".
 """
 
-def get_model_and_tokenizer(model_id, device):
-    """Load 4-bit quantised model and tokenizer."""
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16
-    )
+def setup_environment():
+    # Sets up GPU visibility and creates the output directory.
+    print(f"Restricting execution to GPU: {TARGET_GPU}")
     
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=CONFIG["hf_token"])
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        device_map=device,
-        token=CONFIG["hf_token"]
-    )
-    
-    tokenizer.padding_side = 'left'
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    return model, tokenizer
+    if "cuda" in TARGET_GPU:
+        try:
+            if not os.path.exists(OUTPUT_DIR):
+                print(f"Creating output directory: {OUTPUT_DIR}")
+                os.makedirs(OUTPUT_DIR)
+        except Exception as e:
+            print(f"Error creating directory: {e}")
 
-def build_few_shot_context(file_paths):
-    """Construct few-shot examples string from CSV file."""
-    examples = []
-    for path in file_paths:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            for _, row in df.iterrows():
-                examples.append((str(row['comment']).strip(), int(row['level-1'])))
-    
-    random.seed(CONFIG["seed"])
-    random.shuffle(examples)
-    
-    formatted_str = ""
-    used_comments = set()
-    
-    for comment, label in examples:
-        used_comments.add(comment)
-        reasoning = "Contains regional bias." if label == 1 else "No regional bias."
-        formatted_str += f"\n--- Example ---\nComment: \"{comment}\"\nReasoning: {reasoning}\nClassification: {label}\n--- End Example ---\n"
+def load_model_and_tokenizer():
+    # Loads model in full precision
+    print(f"Loading model: {MODEL_ID}...", flush=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            dtype=torch.float16, 
+            device_map=TARGET_GPU,
+            trust_remote_code=True
+        )
         
-    return formatted_str, used_comments
+        tokenizer.padding_side = 'left'
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        return model, tokenizer
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        sys.exit(1)
 
-def extract_prediction(response_text):
-    """Parse model output for reasoning and classification label."""
-    clean_text = re.sub(r'<.*?>', '', response_text, flags=re.DOTALL).strip()
+def load_few_shot_examples(regional_path, total_examples=50):
+    # Loads only regional bias examples.
+    print(f"Loading {total_examples} regional bias examples...", flush=True)
+    all_examples = []
+
+    if not os.path.exists(regional_path):
+        print(f"FATAL ERROR: File not found: {regional_path}")
+        sys.exit(1)
     
-    # Default values
-    prediction = 0
-    reasoning = clean_text.split("Classification:")[0].strip()
+    df = pd.read_csv(regional_path)
+    target_col = GROUND_TRUTH_COLUMN_NAME if GROUND_TRUTH_COLUMN_NAME in df.columns else 'label'
+    filtered = df[df[target_col] == 1]
     
-    # Regex for explicit classification
-    match = re.search(r"Classification:\s*([01])", clean_text)
-    if match:
-        prediction = int(match.group(1))
-    elif "REGIONAL BIAS" in clean_text.upper():
+    n = min(len(filtered), total_examples)
+    if len(filtered) < total_examples:
+        print(f"Warning: Requested {total_examples} examples but file only has {len(filtered)}. Using all available.")
+    
+    reg_samples = filtered.sample(n=n, random_state=SEED)
+    for _, row in reg_samples.iterrows():
+        all_examples.append({'comment': str(row[COMMENT_COLUMN_NAME]), 'label': 1})
+
+    random.shuffle(all_examples)
+
+    examples_str = ""
+    used_comments_set = set()
+    for example in all_examples:
+        comment = example['comment'].strip()
+        label = example['label']
+        used_comments_set.add(comment)
+        reasoning = "Contains specific regional stereotyping/generalization."
+        examples_str += f"\n--- Example ---\nComment: \"{comment}\"\n<think>\n{reasoning}\n</think>\nClassification: {label}\n--- End Example ---\n"
+
+    print(f"   Loaded {len(all_examples)} examples total.", flush=True)
+    return examples_str, used_comments_set
+
+def parse_response(response):
+    think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL | re.IGNORECASE)
+    reasoning = think_match.group(1).strip() if think_match else "No reasoning provided"
+
+    prediction = 0 
+    if re.search(r"Classification:?\s*1", response, re.IGNORECASE):
         prediction = 1
-        
+    elif re.search(r"Classification:?\s*0", response, re.IGNORECASE):
+        prediction = 0
+
     return reasoning, prediction
 
-def generate_report(csv_path):
-    """Save classification report and confusion matrix."""
-    if not os.path.exists(csv_path):
-        return
+def generate_evaluation_outputs(csv_path):
+    # Generates classification report and confusion matrix 
+    print("Generating evaluation metrics...", flush=True)
+    try:
+        df = pd.read_csv(csv_path)
+        y_true = pd.to_numeric(df['true_label'], errors='coerce').fillna(0).astype(int)
+        y_pred = pd.to_numeric(df['predicted_label'], errors='coerce').fillna(0).astype(int)
 
-    df = pd.read_csv(csv_path).dropna(subset=['predicted_label'])
-    y_true = df['true_label'].astype(int)
-    y_pred = df['predicted_label'].astype(int)
-    
-    # Text Report
-    report = classification_report(y_true, y_pred, target_names=['No Bias (0)', 'Bias (1)'], zero_division=0)
-    with open(REPORT_FILE, 'w') as f:
-        f.write(report)
-    print(f"\n{report}")
+        report = classification_report(y_true, y_pred, target_names=['NON-REGIONAL BIAS (0)', 'REGIONAL BIAS (1)'], zero_division=0)
+        report_path = os.path.join(OUTPUT_DIR, "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write(f"Classification Report for {MODEL_ID}\n\n{report}")
+        print(f"Report saved to {report_path}")
+        print(report)
+        
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=['NON-REGIONAL BIAS (0)', 'REGIONAL BIAS (1)'],
+                    yticklabels=['NON-REGIONAL BIAS (0)', 'REGIONAL BIAS (1)'])
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title(f'Confusion Matrix - {MODEL_ID}')
+        
+        cm_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
+        plt.savefig(cm_path)
+        print(f"Confusion matrix saved to {cm_path}")
 
-    # Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Pred: 0', 'Pred: 1'],
-                yticklabels=['True: 0', 'True: 1'])
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig(MATRIX_IMG)
+    except Exception as e:
+        print(f"Error generating evaluation outputs: {e}")
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    device = torch.device(CONFIG["target_device"] if torch.cuda.is_available() else "cpu")
+    setup_environment()
+    few_shot_prompt, used_comments = load_few_shot_examples(REGIONAL_BIAS_EXAMPLES_PATH, total_examples=50)
     
-    # Load resources
-    model, tokenizer = get_model_and_tokenizer(CONFIG["model_id"], device)
-    few_shot_prompt, exclude_comments = build_few_shot_context(FEW_SHOT_SOURCE)
+    print(f"\nReading main dataset: {INFERENCE_FILE_PATH}")
+    try:
+        df_full = pd.read_csv(INFERENCE_FILE_PATH)
+    except FileNotFoundError:
+        print(f"Error: Input file not found at {INFERENCE_FILE_PATH}")
+        return
+
+    if COMMENT_COLUMN_NAME not in df_full.columns:
+         raise ValueError(f"Column '{COMMENT_COLUMN_NAME}' not found in CSV.")
+
+    print(f"Filtering out {len(used_comments)} few-shot examples from inference set...")
+    df = df_full[~df_full[COMMENT_COLUMN_NAME].astype(str).str.strip().isin(used_comments)].copy()
+    print(f"Total comments to process: {len(df)}")
+
+    processed_count = 0
+    if os.path.exists(RESULTS_CSV_PATH):
+        try:
+            processed_count = len(pd.read_csv(RESULTS_CSV_PATH))
+            print(f"Resuming from index {processed_count}...")
+        except pd.errors.EmptyDataError:
+            print("Results file empty. Starting from scratch.")
     
-    # Data Loading
-    df_full = pd.read_csv(INPUT_DATA)
-    processed_comments = set()
-    if os.path.exists(PARTIAL_OUTPUT):
-        df_prog = pd.read_csv(PARTIAL_OUTPUT)
-        processed_comments = set(df_prog['comment'].astype(str).str.strip())
-        print(f"Resuming from {len(processed_comments)} processed entries.")
+    if processed_count >= len(df):
+        print("All comments processed.")
+        generate_evaluation_outputs(RESULTS_CSV_PATH)
+        return
 
-    to_exclude = exclude_comments.union(processed_comments)
-    df_process = df_full[~df_full['comment'].astype(str).str.strip().isin(to_exclude)].copy()
+    df_to_process = df.iloc[processed_count:]
+   
+    model, tokenizer = load_model_and_tokenizer()
+    print(f"Starting inference on {len(df_to_process)} comments.")
     
-    print(f"Starting inference on {len(df_process)} samples.")
-
-    batch_size = CONFIG["batch_size"]
-    with torch.no_grad():
-        for i in tqdm(range(0, len(df_process), batch_size), desc="Processing"):
-            batch = df_process.iloc[i:i+batch_size]
-            prompts = []
+    for i in tqdm(range(0, len(df_to_process), BATCH_SIZE), desc="Processing Batches"):
+        batch_df = df_to_process.iloc[i:i+BATCH_SIZE]
+        batch_prompts = []
+    
+        for _, row in batch_df.iterrows():
+            comment_text = str(row[COMMENT_COLUMN_NAME])
+            user_msg = (f"{few_shot_prompt}\n"
+                        f"--- Classify the following comment ---\n"
+                        f"Comment: \"{comment_text}\"")
             
-            # Prepare Prompt
-            for _, row in batch.iterrows():
-                user_content = f"{few_shot_prompt}\n--- Classify ---\nComment: \"{row['comment']}\""
-                chat = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_content}]
-                prompts.append(tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True))
+            messages = [
+                {"role": "system", "content": MODEL_PROMPT},
+                {"role": "user", "content": user_msg}
+            ]
+            batch_prompts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
 
-            # Tokenize
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(device)
-            
-            try:
-                outputs = model.generate(
-                    inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    max_new_tokens=CONFIG["max_new_tokens"],
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-                
-                decoded = tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                
-                # Parse Results
-                results = []
-                for idx, text in enumerate(decoded):
-                    reasoning, pred = extract_prediction(text)
-                    results.append({
-                        'comment': batch.iloc[idx]['comment'],
-                        'true_label': batch.iloc[idx]['level-1'],
-                        'predicted_label': pred,
-                        'reasoning': reasoning
-                    })
-                
-                # Saving Progress
-                pd.DataFrame(results).to_csv(
-                    PARTIAL_OUTPUT, 
-                    mode='a', 
-                    header=not os.path.exists(PARTIAL_OUTPUT), 
-                    index=False
-                )
+        inputs = tokenizer(
+            batch_prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=4096 
+        ).to(model.device)
 
-            except Exception as e:
-                print(f"Batch error: {e}")
-            
-            # Memory Cleanup
-            del inputs, outputs
-            gc.collect()
-            torch.cuda.empty_cache()
+        with torch.no_grad():
+            generated_ids = model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=512,
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+                temperature=0.1
+            )
 
-    # Finalise
-    if os.path.exists(PARTIAL_OUTPUT):
-        if os.path.exists(FINAL_OUTPUT):
-            os.remove(FINAL_OUTPUT)
-        os.rename(PARTIAL_OUTPUT, FINAL_OUTPUT)
-        print(f"Inference complete. Results saved to {FINAL_OUTPUT}")
-        generate_report(FINAL_OUTPUT)
+        decoded_responses = tokenizer.batch_decode(generated_ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        
+        batch_results = []
+        for idx, response in enumerate(decoded_responses):
+            reasoning, prediction = parse_response(response)
+            original_row = batch_df.iloc[idx]
+            batch_results.append({
+                'comment': original_row[COMMENT_COLUMN_NAME],
+                'true_label': original_row[GROUND_TRUTH_COLUMN_NAME] if GROUND_TRUTH_COLUMN_NAME in original_row else -1,
+                'predicted_label': prediction,
+                'model_response': reasoning
+            })
+
+        results_df = pd.DataFrame(batch_results)
+        is_first_write = not os.path.exists(RESULTS_CSV_PATH)
+        results_df.to_csv(RESULTS_CSV_PATH, mode='a', header=is_first_write, index=False)
+    
+        del inputs, generated_ids, decoded_responses
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print("\nInference Complete.")
+    
+    if GROUND_TRUTH_COLUMN_NAME in df.columns:
+        generate_evaluation_outputs(RESULTS_CSV_PATH)
 
 if __name__ == "__main__":
     main()
