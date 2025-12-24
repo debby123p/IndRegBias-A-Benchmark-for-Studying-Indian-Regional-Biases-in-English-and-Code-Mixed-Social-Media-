@@ -4,7 +4,7 @@ import pandas as pd
 import re
 from tqdm import tqdm
 from huggingface_hub import login
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -61,7 +61,7 @@ Your response must include a brief line of reasoning followed by the final class
 """
 
 def setup_environment():
-    """Sets up GPU visibility and creates the output directory."""
+    # Sets up GPU visibility and creates the output directory.
     print(f"Restricting execution to GPU: {TARGET_GPU}")
     os.environ["CUDA_VISIBLE_DEVICES"] = TARGET_GPU
     
@@ -70,29 +70,20 @@ def setup_environment():
         os.makedirs(OUTPUT_DIR)
 
 def load_model_and_tokenizer():
-    """
-    Handles authentication and loads the Gemma model in INT4 precision.
-    """
-    print("Logging into Hugging Face Hub...")
+     # Handles authentication and loads the full model.
+    print("Logging into Hugging Face Hub.")
     login(token=HF_API_KEY)
 
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    device_map = "auto"
+    print(f"Loading model: {MODEL_ID} in full precision.")
     
-    print(f"Loading model: {MODEL_ID} with INT4 quantization...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        quantization_config=quantization_config,
-        device_map=device_map,
+        torch_dtype=torch.bfloat16, 
+        device_map="auto",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    
+   
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'left'
@@ -100,7 +91,7 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 def parse_single_response(response_text):
-    """Robustly parses a single model response text to ensure a 0 or 1 output."""
+    # Robustly parses a single model response text to ensure a 0 or 1 output. 
     prediction = -1
     reasoning = response_text.split("Classification:")[0].strip() or response_text
 
@@ -120,23 +111,26 @@ def parse_single_response(response_text):
     return prediction, reasoning
 
 def classify_batch(comments, model, tokenizer):
-    """
-    Generates classifications for a batch of comments.
-    """
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": f"{SYSTEM_PROMPT}\n\nComment: \"{comment}\"\n\nBased on your analysis, provide your reasoning and final classification."}],
-            tokenize=False,
-            add_generation_prompt=True
-        ) for comment in comments
+    # Generates classifications for a batch of comments.
+    messages = [
+        [
+            {"role": "user", "content": f"{SYSTEM_PROMPT}\n\nComment: \"{comment}\"\n\nBased on your analysis, provide your reasoning and final classification."}
+        ] for comment in comments
     ]
+    
+    prompts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
     
     inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(model.device)
     
     results = []
     try:
         with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=150, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=150, 
+                do_sample=False, 
+                pad_token_id=tokenizer.eos_token_id
+            )
         
         response_texts = tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
@@ -154,8 +148,8 @@ def classify_batch(comments, model, tokenizer):
     return results
 
 def generate_evaluation_outputs(df):
-    """Generates and saves the classification report and confusion matrix."""
-    valid_df = df[df['predicted_label'] != -1].copy()
+    # Generates and saves the classification report and confusion matrix.
+    valid_df = df.copy()
     if valid_df.empty:
         print("No valid predictions were made. Skipping evaluation.")
         return
@@ -163,7 +157,7 @@ def generate_evaluation_outputs(df):
     y_true = valid_df[GROUND_TRUTH_COLUMN_NAME].astype(int)
     y_pred = valid_df['predicted_label'].astype(int)
 
-    report = classification_report(y_true, y_pred, target_names=["NON-REGIONAL BIAS (0)", "REGIONAL BIAS (1)"])
+    report = classification_report(y_true, y_pred, target_names=["NON-REGIONAL BIAS (0)", "REGIONAL BIAS (1)"], zero_division=0)
     report_path = os.path.join(OUTPUT_DIR, "classification_report.txt")
     with open(report_path, "w") as f:
         f.write(f"Classification Report for model: {MODEL_ID}\n\n")
@@ -184,12 +178,16 @@ def generate_evaluation_outputs(df):
     print(f"Confusion matrix saved to {cm_path}")
 
 def main():
-    """Main function to orchestrate the entire classification process."""
+    # Main function to orchestrate the entire classification process.
     setup_environment()
     model, tokenizer = load_model_and_tokenizer()
     
     print(f"\nReading input CSV from: {INPUT_CSV_PATH}")
-    df = pd.read_csv(INPUT_CSV_PATH)
+    try:
+        df = pd.read_csv(INPUT_CSV_PATH)
+    except FileNotFoundError:
+        print(f"Error: The file {INPUT_CSV_PATH} was not found.")
+        return
 
     if COMMENT_COLUMN_NAME not in df.columns:
         raise ValueError(f"Comment column '{COMMENT_COLUMN_NAME}' not found in the CSV.")
