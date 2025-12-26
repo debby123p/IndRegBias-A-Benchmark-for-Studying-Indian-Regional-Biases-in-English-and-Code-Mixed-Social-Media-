@@ -23,8 +23,7 @@ import random
 os.environ["CUDA_VISIBLE_DEVICES"] = "" # Target GPU node
 
 CONFIG = {
-    "model_id": "mistralai/Mistral-7B-Instruct-v0.3", 
-    "model_id": "Qwen/Qwen3-8B", # Model ID
+    "model_id": "mistralai/Mistral-7B-Instruct-v0.3", # Model ID
     "dataset_path": "", # Path to the Dataset
     "output_root_dir": "", # Output Directory
     "seed": 42,
