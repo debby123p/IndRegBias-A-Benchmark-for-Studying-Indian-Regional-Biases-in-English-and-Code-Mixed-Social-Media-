@@ -104,7 +104,7 @@ Eight prominent LLMs were selected for their instruction-following and reasoning
 
 1) Zero-Shot Results
 
-   ![image](https://github.com/debby123p/CAN-LARGE-LANGUAGE-MODELS-DETECT-INDIAN-REGIONAL-BIAS-DATASET-ANALYSIS/blob/main/Images/Screenshot%20from%202025-12-08%2015-39-15.png)
+   ![image](https://github.com/debby123p/CAN-LARGE-LANGUAGE-MODELS-DETECT-INDIAN-REGIONAL-BIAS-DATASET-ANALYSIS/blob/main/Images/Binary%20Classification%20(1).png)
 
 3) Few-Shot Results
 
