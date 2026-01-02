@@ -71,14 +71,14 @@ def setup_environment():
 
 def load_model_and_tokenizer():
     # Handles authentication and loads the model in full precision
-    print("Logging into Hugging Face Hub...")
+    print("Logging into Hugging Face Hub.")
     login(token=HF_API_KEY)
 
-    print(f"Loading model: {MODEL_ID} in full precision (bfloat16)...")
+    print(f"Loading model: {MODEL_ID} in full precision (bfloat16).")
     
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16, 
+        dtype=torch.bfloat16, 
         device_map="auto"
     )
 
@@ -121,14 +121,14 @@ def classify_batch(comments, model, tokenizer):
     
     prompts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
     
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(model.device)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(model.device)
     
     results = []
     try:
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, 
-                max_new_tokens=400, # Increased to allow for "Thinking" process
+                max_new_tokens=150,
                 do_sample=False, 
                 pad_token_id=tokenizer.eos_token_id
             )
@@ -197,7 +197,7 @@ def main():
     
     all_results = []
     
-    print(f"Starting classification for {len(comments_to_process)} comments with batch size {BATCH_SIZE}...")
+    print(f"Starting classification for {len(comments_to_process)} comments with batch size {BATCH_SIZE}.")
     
     for i in tqdm(range(0, len(comments_to_process), BATCH_SIZE), desc="Classifying batches"):
         batch_comments = comments_to_process[i:i + BATCH_SIZE]
