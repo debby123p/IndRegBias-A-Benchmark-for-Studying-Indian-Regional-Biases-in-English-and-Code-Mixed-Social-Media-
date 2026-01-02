@@ -21,7 +21,7 @@ from sklearn.metrics import classification_report, accuracy_score, confusion_mat
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 
-MODEL_ID = "Qwen/Qwen3-8B" 
+MODEL_ID = "Qwen/Qwen3-8B" # Model ID
 
 DATASET_PATH = "" # Dataset file path
 OUTPUT_ROOT_DIR = "" # Output Directory
@@ -33,7 +33,7 @@ NUM_CHUNKS = 10
 NUM_FOLDS = 5
 
 def format_example(row, is_test=False):
-    prompt = f"Analyze the following comment and classify it as Regional Bias (1) or Non-Regional Bias (0).\n\nComment: {row['comment']}\n\nClassification:"
+    prompt = f"Analyse the following comment and classify it as Regional Bias (1) or Non-Regional Bias (0).\n\nComment: {row['comment']}\n\nClassification:"
     
     if is_test:
         return {"prompt": prompt, "label": row['is RB?']}
