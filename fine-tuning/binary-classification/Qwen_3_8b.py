@@ -2,8 +2,13 @@ import os
 import torch
 import pandas as pd
 import numpy as np
-from datasets import Dataset, concatenate_datasets
-from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+import gc
+import shutil
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datasets import Dataset
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -12,307 +17,305 @@ from transformers import (
     set_seed
 )
 from trl import SFTTrainer, SFTConfig
-from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
-import gc
-import shutil
-import random
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "" # Target GPU node
+MODEL_ID = "Qwen/Qwen3-8B" 
 
-CONFIG = {
-    "model_id": "Qwen/Qwen3-8B", # Model ID
-    "dataset_path": "", # Path to the Dataset
-    "output_root_dir": "", # Output Directory
-    "seed": 42,
-    "max_seq_length": 512,
-    "label_map": {0: "non-regional bias", 1: "regional bias"},
-    "num_folds": 5
-}
+DATASET_PATH = "" # Dataset file path
+OUTPUT_ROOT_DIR = "" # Output Directory
+TARGET_GPU = "" # Target GPU node 
+SEED = 42
+MAX_SEQ_LENGTH = 2048 
+MAX_NEW_TOKENS = 150 
+NUM_CHUNKS = 10 
+NUM_FOLDS = 5
 
-MODEL_PROMPT = """
-You are an expert in identifying regional biases in social media comments about Indian states and regions. Your task is to classify whether a comment contains regional biases or not.
+def format_example(row, is_test=False):
+    prompt = f"Analyze the following comment and classify it as Regional Bias (1) or Non-Regional Bias (0).\n\nComment: {row['comment']}\n\nClassification:"
+    
+    if is_test:
+        return {"prompt": prompt, "label": row['is RB?']}
+    else:
+        return {"text": f"{prompt} {row['is RB?']}"}
 
-Task: Classify the given comment as either "REGIONAL BIAS" (1) or "NON-REGIONAL BIAS" (0).
+def setup_env():
+    # Sets up GPU visibility.
+    os.environ["CUDA_VISIBLE_DEVICES"] = TARGET_GPU
+    set_seed(SEED)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    if not os.path.exists(OUTPUT_ROOT_DIR):
+        os.makedirs(OUTPUT_ROOT_DIR)
 
-Definition:
-- REGIONAL BIAS (1): Comments that reinforce or propagate biases about Indian states, regions, or their people based on linguistic, cultural, economic, political, or infrastructural aspects. The comments can reflect either positive or negative biases towards specific states or regions.
-- NON-REGIONAL BIAS (0): Comments that are neutral or factual without generalisations, or unrelated to regional characteristics.
+def load_data():
+    # Load the Dataset
+    print(f"Loading dataset from {DATASET_PATH}.")
+    df = pd.read_csv(DATASET_PATH)
+    if 'is RB?' not in df.columns or 'comment' not in df.columns:
+        raise ValueError("Dataset missing 'is RB?' or 'comment' columns.")
+    df['is RB?'] = df['is RB?'].astype(int)
+    df['comment'] = df['comment'].astype(str).str.strip()
+    df = df.dropna(subset=['comment'])
+    df = df.reset_index(drop=True) 
+    return df
 
-Step-by-Step Analysis Process:
-Step 1: Identify Regional References
-Think: Does this comment mention or refer to:
-- Specific Indian states (e.g., Bihar, Kerala, Punjab, etc.)
-- Regional groups (e.g., South Indians, North Indians, etc.)
-- Cities or regions within India
-- Language communities within India
-
-Step 2: Check for Elements reinforcing biases
-Look for these patterns:
-- Generalisations about people from a state or a regional group ("All X are Y")
-- Assumptions about state/regional characteristics
-- Comparative statements that imply superiority/inferiority
-- Overgeneralized cultural, linguistic, economic, political, or infrastructural claims
-
-Step 3: Assess the Nature of the Statement
-Consider:
-- Is this a factual observation or a generalised assumption?
-- Does it reinforce existing biases?
-- Is it based on a broad generalisation?
-- Does it perpetuate divisions?
-
-Step 4: Final Classification
-Based on the analysis above, classify as:
-- REGIONAL BIAS (1) if the comment reinforces regional biases or stereotypes
-- NON-REGIONAL BIAS (0) if the comment is neutral, factual, or doesn't contain regional bias.
-
-Your response must include a brief line of reasoning followed by the final classification in the format "Classification: [0 or 1]".
-"""
-
-set_seed(CONFIG["seed"])
-random.seed(CONFIG["seed"])
-np.random.seed(CONFIG["seed"])
-
-def load_data(csv_path):
-    # Loads Dataset
-    print(f"Loading dataset from {csv_path}.")
+def get_model_and_tokenizer():
+    # Loads the full model.
     try:
-        df = pd.read_csv(csv_path)
-        if 'level-1' not in df.columns or 'comment' not in df.columns:
-             raise ValueError("Dataset must contain 'level-1' and 'comment' columns.")
-             
-        df['level-1'] = df['level-1'].astype(int)
-        df['comment'] = df['comment'].astype(str)
-        return df
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            device_map="auto",
+            dtype=torch.bfloat16, 
+            trust_remote_code=True
+        )
+        
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left" 
+        
+        return model, tokenizer
     except Exception as e:
-        raise RuntimeError(f"Failed to load dataset: {e}")
+        raise RuntimeError(f"Failed to load model {MODEL_ID}: {e}")
 
-def format_prompt(row, tokenizer):
-    # Formats a row into the Qwen chat template.
-    label_text = CONFIG["label_map"][row['level-1']]
+def predict_and_save(model, tokenizer, df, fold_dir, prefix):
+    # Predictions and Saving the model.
+    print(f"Running inference on {prefix.upper()} set for {fold_dir}.")
     
-    messages = [
-        {"role": "system", "content": MODEL_PROMPT},
-        {"role": "user", "content": f"Comment: \"{row['comment']}\""},
-        {"role": "assistant", "content": label_text}
-    ]
+    predictions = []
+    batch_size = 8 
+    prompts = [format_example(row, is_test=True)["prompt"] for _, row in df.iterrows()]
     
-    return {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
-
-def get_tokenizer(model_id):
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
-def train_fold(fold_idx, train_df, val_df, tokenizer):
-    # Trains a model for a specific fold.
-    fold_output_dir = os.path.join(CONFIG["output_root_dir"], f"fold_{fold_idx}")
-    print(f"\n--- Training Fold {fold_idx} ---")
+    for i in tqdm(range(0, len(prompts), batch_size), desc=f"Generating {prefix}"):
+        batch_prompts = prompts[i:i+batch_size]
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LENGTH).to("cuda")
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=MAX_NEW_TOKENS, 
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        decoded = tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        
+        for text in decoded:
+            if "1" in text:
+                predictions.append(1)
+            elif "0" in text:
+                predictions.append(0)
+            elif "regional bias" in text.lower() and "non" not in text.lower():
+                predictions.append(1)
+            else:
+                predictions.append(0) 
     
-    train_dataset = Dataset.from_pandas(train_df)
-    val_dataset = Dataset.from_pandas(val_df)
-    train_data = train_dataset.map(lambda x: format_prompt(x, tokenizer), num_proc=4)
-    val_data = val_dataset.map(lambda x: format_prompt(x, tokenizer), num_proc=4)
+    # Save Metrics & Files
+    y_true = df['is RB?'].tolist()
+    
+    # Save Predictions CSV
+    res_df = df.copy()
+    res_df['predicted_label'] = predictions
+    csv_path = os.path.join(fold_dir, f"{prefix}_predictions.csv")
+    res_df.to_csv(csv_path, index=False)
+    print(f"Saved {prefix} predictions to {csv_path}")
+    
+    # Metrics
+    acc = accuracy_score(y_true, predictions)
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, predictions, average='macro', zero_division=0)
+    
+    metrics = {
+        f"{prefix}_Accuracy": acc,
+        f"{prefix}_F1_Macro": f1,
+        f"{prefix}_Precision_Macro": precision,
+        f"{prefix}_Recall_Macro": recall
+    }
+    
+    # Save Classification Report
+    report = classification_report(y_true, predictions, target_names=["Non-Regional Bias (0)", "Regional Bias (1)"])
+    txt_path = os.path.join(fold_dir, f"{prefix}_classification_report.txt")
+    with open(txt_path, "w") as f:
+        f.write(report)
+    print(f"Saved {prefix} report to {txt_path}")
+    
+    # Save Confusion Matrix
+    cm = confusion_matrix(y_true, predictions)
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Non-Bias (0)', 'Bias (1)'], 
+                yticklabels=['Non-Bias (0)', 'Bias (1)'])
+    plt.title(f'{prefix.capitalize()} Confusion Matrix - Fold')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    png_path = os.path.join(fold_dir, f"{prefix}_confusion_matrix.png")
+    plt.savefig(png_path)
+    plt.close()
+    print(f"Saved {prefix} confusion matrix to {png_path}")
+    
+    return metrics
 
-    model = AutoModelForCausalLM.from_pretrained(
-        CONFIG["model_id"],
-        dtype=torch.bfloat16,
-        device_map="cuda",
-        trust_remote_code=True
-    )
-    model.config.use_cache = False
-    model.config.pretraining_tp = 1
-
+def train_and_eval_fold(fold_idx, train_df, val_df, test_df):
+    fold_dir = os.path.join(OUTPUT_ROOT_DIR, f"fold_{fold_idx}")
+    os.makedirs(fold_dir, exist_ok=True)
+    
+    print(f"\n=== Processing Fold {fold_idx} ===")
+    
+    # Save Train/Val/Test Datasets
+    train_df.to_csv(os.path.join(fold_dir, "train.csv"), index=False)
+    val_df.to_csv(os.path.join(fold_dir, "val.csv"), index=False)
+    test_df.to_csv(os.path.join(fold_dir, "test.csv"), index=False)
+    
+    # Prepare Data
+    train_ds = Dataset.from_pandas(train_df).map(lambda x: format_example(x, is_test=False))
+    val_ds = Dataset.from_pandas(val_df).map(lambda x: format_example(x, is_test=False))
+    
+    model, tokenizer = get_model_and_tokenizer()
+    
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        lora_dropout=0.1,
+        lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
-
+    
     training_args = SFTConfig(
-        output_dir=os.path.join(fold_output_dir, "checkpoints"),
-        num_train_epochs=5,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=2,
-        optim="adamw_8bit",
-        logging_steps=25,
+        output_dir=os.path.join(fold_dir, "checkpoints"),
+        num_train_epochs=10, 
+        per_device_train_batch_size=4, 
+        gradient_accumulation_steps=8, 
         learning_rate=2e-4,
-        weight_decay=0.001,
         fp16=False,
         bf16=True,
+        logging_steps=20,
+        optim="adamw_8bit", 
+        warmup_ratio=0.03,
         max_grad_norm=0.3,
         max_steps=-1,
-        warmup_ratio=0.03,
-        group_by_length=True,
         lr_scheduler_type="cosine",
-        report_to="none",
-        do_eval=True,
         eval_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=1,
+        max_length=MAX_SEQ_LENGTH,
+        dataset_text_field="text",
+        packing=False,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
-        save_total_limit=1,
-        dataset_text_field="text",
-        max_seq_length=CONFIG["max_seq_length"],
-        packing=False,
+        gradient_checkpointing=True 
     )
-
+    
     trainer = SFTTrainer(
         model=model,
-        processing_class=tokenizer,
         args=training_args,
-        train_dataset=train_data,
-        eval_dataset=val_data,
+        train_dataset=train_ds,
+        eval_dataset=val_ds, 
         peft_config=peft_config,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.01)]
+        processing_class=tokenizer,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.01)] 
     )
-
+    
+    print("Starting Training.")
     trainer.train()
     
-    adapter_path = os.path.join(fold_output_dir, "best_adapter")
+    # Save Best Adapter
+    adapter_path = os.path.join(fold_dir, "best_adapter")
     trainer.save_model(adapter_path)
-    metrics = trainer.evaluate()
-    val_loss = metrics['eval_loss']
     
     del model, trainer
     torch.cuda.empty_cache()
     gc.collect()
     
-    return adapter_path, val_loss
-
-def parse_model_response(response_text):
-    # Parses Classification: 0 or 1 from response.
-    match = re.search(r'Classification:\s*([01])', response_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-    if "regional bias" in response_text.lower() and "non-regional bias" not in response_text.lower():
-        return 1
-    if "non-regional bias" in response_text.lower():
-        return 0
-    if "1" in response_text: 
-        return 1
-    if "0" in response_text:
-        return 0
-        
-    return 0 # Default
-
-def evaluate_fold(fold_idx, adapter_path, val_df, tokenizer):
-    # Evaluates the trained fold model.
-    print(f"\n--- Evaluating Fold {fold_idx} ---")
-    
-    base_model = AutoModelForCausalLM.from_pretrained(
-        CONFIG["model_id"],
+    # Evaluation Phase
+    print("Loading best model for evaluation.")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        device_map="auto",
         dtype=torch.bfloat16,
-        device_map="cuda",
         trust_remote_code=True
     )
-    model = PeftModel.from_pretrained(base_model, adapter_path)
+    model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
-
-    predictions = []
-    true_labels_int = val_df['level-1'].tolist()
     
-    dataset = Dataset.from_pandas(val_df)
-
-    for example in tqdm(dataset, desc=f"Inferencing Fold {fold_idx}"):
-        messages = [
-            {"role": "system", "content": MODEL_PROMPT},
-            {"role": "user", "content": f"Comment: \"{example['comment']}\""}
-        ]
-        
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(prompt, return_tensors="pt", return_attention_mask=True).to("cuda")
-
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=150, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id)
-        
-        response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-        
-        pred_int = parse_model_response(response)
-        predictions.append(pred_int)
-
-    # Metrics
-    report = classification_report(true_labels_int, predictions, target_names=["Non-Regional Bias (0)", "Regional Bias (1)"], output_dict=True)
-    f1_macro = report['macro avg']['f1-score']
-    acc = accuracy_score(true_labels_int, predictions)
-
-    # Save Predictions
-    res_df = val_df.copy()
-    res_df['predicted_label'] = predictions
-    res_df.to_csv(os.path.join(CONFIG["output_root_dir"], f"fold_{fold_idx}", "predictions.csv"), index=False)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     
-    # Save Report
-    report_text = classification_report(true_labels_int, predictions, target_names=["Non-Regional Bias (0)", "Regional Bias (1)"])
-    with open(os.path.join(CONFIG["output_root_dir"], f"fold_{fold_idx}", "classification_report.txt"), "w") as f:
-        f.write(report_text)
-        
-    del model, base_model
+    # Evaluate Validation Set
+    val_metrics = predict_and_save(model, tokenizer, val_df, fold_dir, "val")
+    print(f"Fold {fold_idx} Val Metrics: {val_metrics}")
+    
+    # Evaluate Test Set
+    test_metrics = predict_and_save(model, tokenizer, test_df, fold_dir, "test")
+    print(f"Fold {fold_idx} Test Metrics: {test_metrics}")
+    
+    # Merge metrics
+    combined_metrics = {**val_metrics, **test_metrics}
+    combined_metrics["Fold"] = fold_idx
+    
+    del model
     torch.cuda.empty_cache()
     gc.collect()
-
-    return f1_macro, acc
+    
+    return combined_metrics
 
 def main():
-    if not os.path.exists(CONFIG["output_root_dir"]):
-        os.makedirs(CONFIG["output_root_dir"])
-        
-    df = load_data(CONFIG["dataset_path"])
-    tokenizer = get_tokenizer(CONFIG["model_id"])
+    setup_env()
+    df = load_data()
+    
+    print(f"\nSplitting dataset into {NUM_CHUNKS} stratified chunks for rotation.")
+    skf = StratifiedKFold(n_splits=NUM_CHUNKS, shuffle=True, random_state=SEED)
 
-    skf = StratifiedKFold(n_splits=CONFIG["num_folds"], shuffle=True, random_state=CONFIG["seed"])
+    chunks_indices = []
+    for _, chunk_idx in skf.split(df.index, df['is RB?']):
+        chunks_indices.append(chunk_idx)
     
     fold_results = []
-    best_f1 = 0.0
-    best_fold_idx = -1
-
-    for fold_idx, (train_index, val_index) in enumerate(skf.split(df, df['level-1'])):
-        current_fold = fold_idx + 1
-        
-        train_df = df.iloc[train_index]
-        val_df = df.iloc[val_index]
-        
-        fold_dir = os.path.join(CONFIG["output_root_dir"], f"fold_{current_fold}")
-        if not os.path.exists(fold_dir):
-            os.makedirs(fold_dir)
-        train_df.to_csv(os.path.join(fold_dir, "train_indices.csv"), index=False)
-        val_df.to_csv(os.path.join(fold_dir, "val_indices.csv"), index=False)
-
-        # Train & Evaluate
-        adapter_path, val_loss = train_fold(current_fold, train_df, val_df, tokenizer)
-        f1, acc = evaluate_fold(current_fold, adapter_path, val_df, tokenizer)
-        
-        print(f"Fold {current_fold} Results -> F1 (Macro): {f1:.4f}, Accuracy: {acc:.4f}")
-        
-        fold_results.append({
-            "fold": current_fold,
-            "f1_macro": f1,
-            "accuracy": acc,
-            "val_loss": val_loss
-        })
-
-        if f1 > best_f1:
-            best_f1 = f1
-            best_fold_idx = current_fold
-            best_model_path = os.path.join(CONFIG["output_root_dir"], "best_model_overall")
-            if os.path.exists(best_model_path):
-                shutil.rmtree(best_model_path)
-            shutil.copytree(adapter_path, best_model_path)
-            print(f"New Best Model found (Fold {current_fold})! Saved to {best_model_path}")
-
-    # Summary
-    results_df = pd.DataFrame(fold_results)
-    results_df.loc['Average'] = results_df.mean()
-    results_df.to_csv(os.path.join(CONFIG["output_root_dir"], "cv_metrics_summary.csv"))
     
-    print("\n=============================================")
-    print("   5-FOLD CV COMPLETE")
-    print("=============================================")
-    print(results_df)
+    for fold_idx in range(NUM_FOLDS): 
+        current_fold = fold_idx + 1
+        test_chunk_ids = [2*fold_idx, 2*fold_idx + 1]
+        val_chunk_id = (2*fold_idx + 2) % NUM_CHUNKS
+        
+        train_chunk_ids = []
+        for i in range(NUM_CHUNKS):
+            if i not in test_chunk_ids and i != val_chunk_id:
+                train_chunk_ids.append(i)
+                
+        print(f"\nConfiguration for Fold {current_fold}:")
+        print(f"  Test Chunks: {test_chunk_ids}")
+        print(f"  Val Chunk:   {[val_chunk_id]}")
+        print(f"  Train Chunks: {train_chunk_ids}")
+        
+        test_indices = np.concatenate([chunks_indices[i] for i in test_chunk_ids])
+        val_indices = chunks_indices[val_chunk_id]
+        train_indices = np.concatenate([chunks_indices[i] for i in train_chunk_ids])
+        
+        train_df = df.iloc[train_indices].copy()
+        val_df = df.iloc[val_indices].copy()
+        test_df = df.iloc[test_indices].copy()
+        
+        metrics = train_and_eval_fold(current_fold, train_df, val_df, test_df)
+        fold_results.append(metrics)
 
+    results_df = pd.DataFrame(fold_results)
+
+    cols = ["Fold"] + [c for c in results_df.columns if c.startswith("test")] + [c for c in results_df.columns if c.startswith("val")]
+    results_df = results_df[cols]
+    
+    avg_row = results_df.mean(numeric_only=True)
+    avg_row["Fold"] = "Average"
+    final_df = pd.concat([results_df, pd.DataFrame([avg_row])], ignore_index=True)
+    
+    print("\n=== 5-Fold Cross-Validation Results ===")
+    print(final_df.to_string(index=False))
+    
+    # Save Summary
+    final_df.to_csv(os.path.join(OUTPUT_ROOT_DIR, "cv_metrics_summary.csv"), index=False)
+    
 if __name__ == "__main__":
     main()
