@@ -24,7 +24,7 @@ GROUND_TRUTH_COLUMN_NAME = "is RB?"
 BATCH_SIZE = 16
 
 # Input/Output files
-INFERENCE_FILENAME = "Dataset - Dataset_final.csv"
+INFERENCE_FILENAME = ""
 INFERENCE_FILE_PATH = os.path.join(BASE_DATA_PATH, INFERENCE_FILENAME)
 RESULTS_CSV_PATH = os.path.join(OUTPUT_DIR, "classification_results_final.csv")
 
@@ -107,7 +107,7 @@ def load_model_and_tokenizer():
         sys.exit(1)
 
 def load_unbalanced_few_shot_examples():
-    # Loads specific unbalanced dataset: 20 Non-Regional Bias + 30 Regional Bias.
+    # Loads unbalanced dataset: 20 Non-Regional Bias + 30 Regional Bias.
     print(f"Loading unbalanced few-shot examples (20 NRB, 30 RB).", flush=True)
     all_examples = []
     if not os.path.exists(NON_REGIONAL_BIAS_EXAMPLES_PATH):
@@ -147,6 +147,7 @@ def load_unbalanced_few_shot_examples():
     return examples_str, used_comments_set
 
 def parse_response(response):
+    # Robustly parses a single model response text to ensure a 0 or 1 output.
     think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL | re.IGNORECASE)
     reasoning = think_match.group(1).strip() if think_match else "No reasoning provided"
 
@@ -160,7 +161,7 @@ def parse_response(response):
 
 def generate_evaluation_outputs(csv_path):
     # Generates classification report and confusion matrix 
-    print("Generating evaluation metrics...", flush=True)
+    print("Generating evaluation metrics.", flush=True)
     try:
         df = pd.read_csv(csv_path)
         y_true = pd.to_numeric(df['true_label'], errors='coerce').fillna(0).astype(int)
@@ -190,6 +191,7 @@ def generate_evaluation_outputs(csv_path):
         print(f"Error generating evaluation outputs: {e}")
 
 def main():
+    # Main function to orchestrate the entire classification process.
     setup_environment()
     few_shot_prompt, used_comments = load_unbalanced_few_shot_examples()
     
@@ -203,7 +205,7 @@ def main():
     if COMMENT_COLUMN_NAME not in df_full.columns:
          raise ValueError(f"Column '{COMMENT_COLUMN_NAME}' not found in CSV.")
 
-    print(f"Filtering out {len(used_comments)} few-shot examples from inference set...")
+    print(f"Filtering out {len(used_comments)} few-shot examples from inference set.")
     df = df_full[~df_full[COMMENT_COLUMN_NAME].astype(str).str.strip().isin(used_comments)].copy()
     print(f"Total comments to process: {len(df)}")
 
@@ -211,7 +213,7 @@ def main():
     if os.path.exists(RESULTS_CSV_PATH):
         try:
             processed_count = len(pd.read_csv(RESULTS_CSV_PATH))
-            print(f"Resuming from index {processed_count}...")
+            print(f"Resuming from index {processed_count}.")
         except pd.errors.EmptyDataError:
             print("Results file empty. Starting from scratch.")
     
@@ -224,7 +226,7 @@ def main():
   
     model, tokenizer = load_model_and_tokenizer()
     
-    print(f"Starting inference on {len(df_to_process)} comments...")
+    print(f"Starting inference on {len(df_to_process)} comments.")
     
     for i in tqdm(range(0, len(df_to_process), BATCH_SIZE), desc="Processing Batches"):
         batch_df = df_to_process.iloc[i:i+BATCH_SIZE]
