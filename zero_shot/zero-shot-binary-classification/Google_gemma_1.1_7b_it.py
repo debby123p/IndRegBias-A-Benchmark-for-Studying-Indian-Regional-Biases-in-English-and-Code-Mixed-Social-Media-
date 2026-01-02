@@ -15,7 +15,7 @@ TARGET_GPU = "" # Target GPU node
 INPUT_CSV_PATH = "" # Dataset file path
 OUTPUT_DIR = "" # Output Directory
 COMMENT_COLUMN_NAME = "comment"
-GROUND_TRUTH_COLUMN_NAME = "level-1"
+GROUND_TRUTH_COLUMN_NAME = "is RB?"
 BATCH_SIZE = 16
 
 MODEL_ID = "google/gemma-1.1-7b-it"
@@ -78,7 +78,7 @@ def load_model_and_tokenizer():
     
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16, 
+        dtype=torch.bfloat16, 
         device_map="auto",
     )
 
@@ -120,7 +120,7 @@ def classify_batch(comments, model, tokenizer):
     
     prompts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
     
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(model.device)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(model.device)
     
     results = []
     try:
