@@ -70,18 +70,35 @@ def setup_environment():
 
 def load_model_and_tokenizer():
     # Handles authentication and loads the full model.
-    print("Logging into Hugging Face Hub...")
+    print("Logging into Hugging Face Hub.")
     login(token=HF_API_KEY)
 
-    print(f"Loading model: {MODEL_ID} in full precision (bfloat16)...")
+    print(f"Loading model: {MODEL_ID} in full precision (bfloat16).")
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         device_map="auto",
-        torch_dtype=torch.bfloat16
+        dtype=torch.bfloat16
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    
+    if tokenizer.chat_template is None:
+        print("Explicitly setting Llama 3 chat template...")
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ '<|start_header_id|>system<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+            "{% elif message['role'] == 'user' %}"
+            "{{ '<|start_header_id|>user<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
+            "{% endif %}"
+        )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
